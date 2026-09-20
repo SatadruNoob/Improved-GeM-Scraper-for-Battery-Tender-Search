@@ -1,0 +1,7 @@
+sys.frozen: False
+sys._MEIPASS: NOT SET
+__file__: E:\GeM Portal Scraper\app.py
+BASE_DIR: E:\GeM Portal Scraper
+DATA_DIR: E:\GeM Portal Scraper\data
+STATUS_FILE: E:\GeM Portal Scraper\data\run_status.json
+Working directory: E:\GeM Portal Scraper

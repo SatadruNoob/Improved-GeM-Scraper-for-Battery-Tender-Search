@@ -1,0 +1,70 @@
+{
+  "extraction_started": "2026-02-28 14:48:43.879882",
+  "extraction_status": "COMPLETED",
+  "sessions_running": 4,
+  "sessions_completed": 4,
+  "session_pids": [
+    3480,
+    22788,
+    24016,
+    22784
+  ],
+  "session1_status": {
+    "keyword": "batter",
+    "output_csv": "E:\\GeM Portal Scraper\\data\\gem_all_bids_session1.csv",
+    "started": "2026-02-28 14:48:45.719018",
+    "status": "COMPLETED",
+    "pages_processed": 119,
+    "new_bids_found": 23,
+    "total_bids_seen": 1124,
+    "completed": "2026-02-28 14:53:11.538851",
+    "total_new_bids": 23,
+    "total_pages": 119,
+    "final_bid_count": 1124
+  },
+  "session2_status": {
+    "keyword": "batter",
+    "output_csv": "E:\\GeM Portal Scraper\\data\\gem_all_bids_session2.csv",
+    "started": "2026-02-28 14:48:55.186877",
+    "status": "COMPLETED",
+    "pages_processed": 119,
+    "new_bids_found": 23,
+    "total_bids_seen": 1136,
+    "completed": "2026-02-28 14:53:19.686321",
+    "total_new_bids": 23,
+    "total_pages": 119,
+    "final_bid_count": 1136
+  },
+  "session3_status": {
+    "keyword": "batter",
+    "output_csv": "E:\\GeM Portal Scraper\\data\\gem_all_bids_session3.csv",
+    "started": "2026-02-28 14:49:05.358476",
+    "status": "COMPLETED",
+    "pages_processed": 119,
+    "new_bids_found": 23,
+    "total_bids_seen": 1141,
+    "completed": "2026-02-28 14:53:29.791568",
+    "total_new_bids": 23,
+    "total_pages": 119,
+    "final_bid_count": 1141
+  },
+  "session4_status": {
+    "keyword": "batter",
+    "output_csv": "E:\\GeM Portal Scraper\\data\\gem_all_bids_session4.csv",
+    "started": "2026-02-28 14:49:15.302951",
+    "status": "COMPLETED",
+    "pages_processed": 119,
+    "new_bids_found": 23,
+    "total_bids_seen": 1133,
+    "completed": "2026-02-28 14:53:37.085546",
+    "total_new_bids": 23,
+    "total_pages": 119,
+    "final_bid_count": 1133
+  },
+  "extraction_completed": "2026-02-28 14:53:38.633826",
+  "sessions_cancelled": "unknown",
+  "merge_completed": "2026-02-28 14:53:41.265767",
+  "total_unique_bids": 2931,
+  "merge_status": "COMPLETED",
+  "final_status": "All sessions completed and merged successfully"
+}
