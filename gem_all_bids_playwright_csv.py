@@ -55,6 +55,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 import json
+import traceback
 
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError
@@ -79,7 +80,8 @@ BASE_DIR = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file_
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-START_URL = "https://bidplus.gem.gov.in/all-bids"
+START_URL = os.environ.get("GEM_START_URL", "https://bidplus.gem.gov.in/all-bids")
+HEADLESS = os.environ.get("GEM_HEADLESS", "0") == "1"
 
 # Use provided output CSV or default session file
 if args.output_csv:
@@ -90,7 +92,13 @@ else:
 RUN_DATE = datetime.now().strftime("%Y-%m-%d")
 
 PAGE_DELAY_SEC = 1.5
-MAX_NEXT_MISSES = 2
+
+# --- Slow-page tolerance (GeM sometimes takes a long time to load a page) ---
+READY_TIMEOUT_MS = int(os.environ.get("GEM_READY_TIMEOUT_MS", 90_000))  # wait for a page's data to finish loading
+NEXT_WAIT_SEC = int(os.environ.get("GEM_NEXT_WAIT_SEC", 60))            # wait for the pagination bar to reappear
+MAX_CLICK_RETRIES = 3          # attempts to move to the next page before giving up
+MAX_EXTRACT_RETRIES = 4        # attempts to read one page before skipping it
+LAST_PAGE_CONFIRMATIONS = 2    # "last page" must be seen this many times in a row
 
 STATUS_FILE = DATA_DIR / "run_status.json"
 LOG_FILE = DATA_DIR / f"scrape_session{SESSION_ID}_status.log"
@@ -288,11 +296,139 @@ def extract_bids(page):
     return bids
 
 # =================================================
+# Slow-page helpers
+# =================================================
+# JS snippets run inside the page.
+# A page is "ready" only when every bid card has its bid no and dates filled in.
+READY_JS = """
+() => {
+  const cards = [...document.querySelectorAll('div.card')]
+      .filter(c => c.querySelector('.bid_no_hover'));
+  if (!cards.length) return false;
+  return cards.every(c => {
+    const t = s => { const e = c.querySelector(s); return e && e.innerText.trim(); };
+    return t('.bid_no_hover') && t('.start_date') && t('.end_date');
+  });
+}
+"""
+
+# A fingerprint of the bids currently on screen (changes when fresh data arrives)
+SIGNATURE_JS = """
+() => [...document.querySelectorAll('.bid_no_hover')]
+        .map(a => a.innerText.trim()).join('|')
+"""
+
+# True once the on-screen bids differ from the previous page's bids
+CHANGED_JS = """
+(prev) => {
+  const sig = [...document.querySelectorAll('.bid_no_hover')]
+        .map(a => a.innerText.trim()).join('|');
+  return sig.length > 0 && sig !== prev;
+}
+"""
+
+
+def page_signature(page):
+    try:
+        return page.evaluate(SIGNATURE_JS)
+    except Exception:
+        return ""
+
+
+def pagination_state(page):
+    """
+    HAS_NEXT : a clickable Next button exists
+    LAST     : Next exists but is disabled (class 'current') -> real last page
+    LOADING  : no pagination bar at all (page is still loading / re-rendering)
+    """
+    try:
+        if page.locator("#light-pagination .next").count() == 0:
+            return "LOADING"
+        if page.locator("#light-pagination .next:not(.current)").count() > 0:
+            return "HAS_NEXT"
+        return "LAST"
+    except Exception:
+        return "LOADING"
+
+
+def wait_for_pagination(page, max_sec):
+    deadline = time.time() + max_sec
+    while time.time() < deadline:
+        state = pagination_state(page)
+        if state != "LOADING":
+            return state
+        time.sleep(1)
+    return "LOADING"
+
+
+def extract_page_with_retry(page):
+    """Wait for the page to finish loading, then read it. Returns a list of bids,
+    or None if the page could not be read after several attempts."""
+    reason = ""
+    for attempt in range(1, MAX_EXTRACT_RETRIES + 1):
+        try:
+            page.wait_for_function(READY_JS, timeout=READY_TIMEOUT_MS)
+            bids = extract_bids(page)
+            if bids and all(b["Bid No"] and b["End Date"] for b in bids):
+                return bids
+            reason = "empty or incomplete bid list"
+        except Exception as e:
+            reason = f"{type(e).__name__}"
+        log(f"Page not ready/readable (attempt {attempt}/{MAX_EXTRACT_RETRIES}: {reason}). Waiting for it to settle...")
+        time.sleep(3 * attempt)
+    return None
+
+
+def go_next(page, prev_sig):
+    """
+    Move to the next results page and wait for FRESH data.
+    Returns:
+      MOVED : new data is on screen
+      LAST  : the disabled Next button was seen repeatedly -> genuine last page
+      STUCK : could not move on after several patient attempts (NOT a real end)
+    """
+    for attempt in range(1, MAX_CLICK_RETRIES + 1):
+        state = wait_for_pagination(page, NEXT_WAIT_SEC)
+
+        if state == "LAST":
+            confirmed = True
+            for _ in range(LAST_PAGE_CONFIRMATIONS):
+                time.sleep(3)
+                if pagination_state(page) != "LAST" or page_signature(page) != prev_sig:
+                    confirmed = False
+                    break
+            if confirmed:
+                return "LAST"
+            log("Last-page signal was not stable (page still changing). Re-checking...")
+            continue
+
+        if state == "LOADING":
+            log(f"Pagination bar missing after {NEXT_WAIT_SEC}s (attempt {attempt}/{MAX_CLICK_RETRIES}) - GeM still loading. Waiting more...")
+            continue
+
+        # HAS_NEXT -> click and wait for new data
+        try:
+            page.locator("#light-pagination .next:not(.current)").first.click(timeout=15_000)
+        except Exception as e:
+            log(f"Next click failed (attempt {attempt}/{MAX_CLICK_RETRIES}): {type(e).__name__}")
+            continue
+
+        time.sleep(PAGE_DELAY_SEC)
+        try:
+            page.wait_for_function(CHANGED_JS, arg=prev_sig, timeout=READY_TIMEOUT_MS)
+            return "MOVED"
+        except TimeoutError:
+            log(f"No fresh data after clicking Next (attempt {attempt}/{MAX_CLICK_RETRIES}). Retrying...")
+
+    return "STUCK"
+
+
+# =================================================
 # Main
 # =================================================
 def main():
     log(f"Starting scraper - Keyword: '{SEARCH_KEYWORD}' | Output: {CSV_FILE.name}")
-    
+
     update_status(
         keyword=SEARCH_KEYWORD,
         output_csv=str(CSV_FILE),
@@ -305,106 +441,122 @@ def main():
     seen_this_run = set()
     write_buffer = []
     new_found = 0
-    next_misses = 0
     page_count = 0
+    failed_pages = []
+    end_reason = "UNKNOWN"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
+        browser = p.chromium.launch(headless=HEADLESS)
+        try:
+            page = browser.new_page()
+            page.set_default_timeout(30_000)
 
-        page.goto(START_URL, timeout=90_000)
-        page.wait_for_selector("div.card", timeout=60_000)
+            page.goto(START_URL, timeout=90_000)
+            page.wait_for_selector("div.card", timeout=60_000)
 
-        search = page.locator("#searchBid")
-        search.fill("")
-        search.type(SEARCH_KEYWORD, delay=100)
-        search.press("Enter")
-        page.wait_for_timeout(1500)
-
-        while True:
-            page_count += 1
-            log(f"Processing page {page_count}")
-            
-            for bid in extract_bids(page):
-                bid_no = bid["Bid No"]
-
-                if "/B/" not in bid_no:
-                    continue
-                if bid_no in seen_this_run:
-                    continue
-                seen_this_run.add(bid_no)
-
-                eh = enddate_hash(bid_no, bid["End Date"])
-
-                if bid_no not in known_bids:
-                    bid.update({
-                        "Bid EndDate Hash": eh,
-                        "First Seen Date": RUN_DATE,
-                        "New Today": "YES",
-                        "End Date Changed": "NO",
-                    })
-                    known_bids.add(bid_no)
-                    bid_to_firstseen[bid_no] = RUN_DATE
-                    bid_to_endhash[bid_no] = eh
-                    new_found += 1
-                else:
-                    bid.update({
-                        "Bid EndDate Hash": eh,
-                        "First Seen Date": bid_to_firstseen[bid_no],
-                        "New Today": "NO",
-                        "End Date Changed": "YES" if eh != bid_to_endhash.get(bid_no) else "NO",
-                    })
-                    bid_to_endhash[bid_no] = eh
-
-                write_buffer.append(bid)
-
-            # Flush buffer after each page
-            append_rows(write_buffer)
-            log(f"Saved {len(write_buffer)} bids from page {page_count}")
-            write_buffer.clear()
-            
-            # Update status
-            update_status(
-                pages_processed=page_count,
-                new_bids_found=new_found,
-                total_bids_seen=len(seen_this_run)
-            )
-
-            next_btn = page.locator("#light-pagination .next:not(.current)")
-            if next_btn.count() == 0:
-                next_misses += 1
-                if next_misses >= MAX_NEXT_MISSES:
-                    log("Pagination completed safely.")
-                    break
-                time.sleep(2)
-                continue
-
-            next_misses = 0
-            first_bid = page.locator(".bid_no_hover", has_text="/B/").first.inner_text()
-            next_btn.click()
-            time.sleep(PAGE_DELAY_SEC)
-
+            before_search = page_signature(page)
+            search = page.locator("#searchBid")
+            search.fill("")
+            search.type(SEARCH_KEYWORD, delay=100)
+            search.press("Enter")
             try:
-                page.wait_for_function(
-                    """
-                    (prev) => {
-                        const el = [...document.querySelectorAll('.bid_no_hover')]
-                          .find(a => a.innerText.includes('/B/'));
-                        return el && el.innerText !== prev;
-                    }
-                    """,
-                    arg=first_bid,
-                    timeout=60_000,
-                )
+                # wait until the filtered results actually replace the unfiltered ones
+                page.wait_for_function(CHANGED_JS, arg=before_search, timeout=60_000)
             except TimeoutError:
-                log("Pagination stalled. Retrying.")
+                log("Search results did not visibly change; continuing anyway.")
 
-        browser.close()
+            while True:
+                page_count += 1
+                log(f"Processing page {page_count}")
 
-    log(f"Session completed: {new_found} new bids found, {page_count} pages processed")
-    
+                bids = extract_page_with_retry(page)
+                if bids is None:
+                    failed_pages.append(page_count)
+                    log(f"Page {page_count} could not be read - skipped (recorded as failed).")
+                    bids = []
+
+                for bid in bids:
+                    bid_no = bid["Bid No"]
+
+                    if "/B/" not in bid_no:
+                        continue
+                    if bid_no in seen_this_run:
+                        continue
+                    seen_this_run.add(bid_no)
+
+                    eh = enddate_hash(bid_no, bid["End Date"])
+
+                    if bid_no not in known_bids:
+                        bid.update({
+                            "Bid EndDate Hash": eh,
+                            "First Seen Date": RUN_DATE,
+                            "New Today": "YES",
+                            "End Date Changed": "NO",
+                        })
+                        known_bids.add(bid_no)
+                        bid_to_firstseen[bid_no] = RUN_DATE
+                        bid_to_endhash[bid_no] = eh
+                        new_found += 1
+                    else:
+                        bid.update({
+                            "Bid EndDate Hash": eh,
+                            "First Seen Date": bid_to_firstseen[bid_no],
+                            "New Today": "NO",
+                            "End Date Changed": "YES" if eh != bid_to_endhash.get(bid_no) else "NO",
+                        })
+                        bid_to_endhash[bid_no] = eh
+
+                    write_buffer.append(bid)
+
+                # Flush buffer after each page
+                append_rows(write_buffer)
+                log(f"Saved {len(write_buffer)} bids from page {page_count}")
+                write_buffer.clear()
+
+                update_status(
+                    pages_processed=page_count,
+                    new_bids_found=new_found,
+                    total_bids_seen=len(seen_this_run),
+                    failed_pages=failed_pages,
+                )
+
+                result = go_next(page, page_signature(page))
+                if result == "MOVED":
+                    continue
+
+                end_reason = result  # LAST (genuine end) or STUCK (gave up)
+                if result == "LAST":
+                    log("Pagination completed (last page confirmed).")
+                else:
+                    log("STOPPED EARLY: could not load the next page after repeated waits. Data so far is saved.")
+                break
+
+        except Exception:
+            end_reason = "ERROR"
+            tb = traceback.format_exc()
+            log("Unexpected error - session stopped. Data so far is saved. See traceback below.")
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(tb + "\n")
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    if end_reason == "LAST" and not failed_pages:
+        final_status = "COMPLETED"
+    elif end_reason == "ERROR":
+        final_status = "FAILED"
+    else:
+        final_status = "INCOMPLETE"
+
+    log(f"Session finished with status {final_status}: {new_found} new bids found, "
+        f"{page_count} pages processed, failed pages: {failed_pages or 'none'}")
+
     update_status(
-        status="COMPLETED",
+        status=final_status,
+        end_reason=end_reason,
+        failed_pages=failed_pages,
         completed=str(datetime.now()),
         total_new_bids=new_found,
         total_pages=page_count,
