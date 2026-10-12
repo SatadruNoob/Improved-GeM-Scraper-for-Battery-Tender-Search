@@ -453,23 +453,30 @@ def run_raw_extraction(progress_cb=None):
                 "USERPROFILE": os.environ.get("USERPROFILE", ""),
                 "APPDATA": os.environ.get("APPDATA", ""),
                 "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", ""),
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUNBUFFERED": "1",
             }
 
+            # Send the scraper's console output (including any crash traceback)
+            # to a file. Previously it went to unread pipes, so crashes were invisible.
+            output_log = DATA_DIR / f"scraper_session{session_id}_output.log"
+
             # Pass session parameters as command-line arguments
-            process = subprocess.Popen(
-                [
-                    str(python_exe),
-                    str(script_path),
-                    "--session-id", str(session_id),
-                    "--keyword", keyword,
-                    "--output-csv", str(csv_file)
-                ],
-                cwd=str(BASE_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=clean_env
-            )
+            with open(output_log, "a", encoding="utf-8") as out_f:
+                process = subprocess.Popen(
+                    [
+                        str(python_exe),
+                        str(script_path),
+                        "--session-id", str(session_id),
+                        "--keyword", keyword,
+                        "--output-csv", str(csv_file)
+                    ],
+                    cwd=str(BASE_DIR),
+                    stdout=out_f,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=clean_env
+                )
 
             session_pids.append(process.pid)
             processes.append((session_id, process))
